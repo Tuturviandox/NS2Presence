@@ -1,0 +1,19 @@
+{
+  "client_id": "1397286652128264252",
+  "poll_seconds": 3,
+  "scan_seconds": 30,
+  "show_version": true,
+  "show_timer": true,
+  "idle_presence": true,
+  "disable_builtin_presence": true,
+  "debug": false,
+  "details_playing": "On {emulator}",
+  "state_playing": "Nintendo Switch 2",
+  "details_idle": "In the menu",
+  "state_idle": "{emulator}",
+  "ignore": [],
+  "emulators": {},
+  "icons": {},
+  "games_dir": "",
+  "upload_icons": true
+}

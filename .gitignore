@@ -1,0 +1,13 @@
+# Runtime data (never commit)
+config.json
+presence.log
+presence.old.log
+cache/
+__pycache__/
+*.py[cod]
+
+# Build output
+NS2Presence.exe
+*.spec
+build/
+dist/
