@@ -199,6 +199,10 @@ extracted from `.nup` files are hosted on catbox.moe (see above).
 | `cache\nup\` | Icons extracted from `.nup` files. |
 | `cache\nup_games.json` | Names, versions and URLs of scanned `.nup` games. |
 
+## Credits
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 ## Uninstall
 
 Right-click the icon → clear **Start with Windows**, then **Quit**.
