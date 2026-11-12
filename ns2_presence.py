@@ -167,7 +167,6 @@ LOGO_BY_BRAND = {
 DEFAULT_CONFIG = {
     "client_id": "1397286652128264252",
     "poll_seconds": 3,
-    "scan_seconds": 30,
     "show_version": True,
     "show_timer": True,
     "idle_presence": True,
@@ -325,9 +324,14 @@ def _process_path(pid: int) -> str | None:
         kernel32.CloseHandle(handle)
 
 
-def process_snapshot() -> dict[str, tuple[int, str]]:
-    """Return {normalized exe path: (pid, exe name)} for every running process."""
-    result: dict[str, tuple[int, str]] = {}
+def process_snapshot() -> dict[str, tuple[int, str, str | None]]:
+    """Return {lowercase exe path: (pid, exe name, real exe path)}.
+
+    The real path keeps its original casing so the install folder can be used
+    as-is. When Windows refuses to give the path, the process is stored under
+    ``<name>exe.exe`` with ``None`` as path (exe name only).
+    """
+    result: dict[str, tuple[int, str, str | None]] = {}
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snapshot or snapshot == wt.HANDLE(-1).value:
         return result
@@ -340,9 +344,9 @@ def process_snapshot() -> dict[str, tuple[int, str]]:
             name = entry.szExeFile
             path = _process_path(entry.th32ProcessID)
             if path:
-                result[path.lower()] = (entry.th32ProcessID, name)
+                result[path.lower()] = (entry.th32ProcessID, name, path)
             elif name:
-                result.setdefault(f"<name>{name.lower()}", (entry.th32ProcessID, name))
+                result.setdefault(f"<name>{name.lower()}", (entry.th32ProcessID, name, None))
             if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                 break
     finally:
@@ -588,13 +592,11 @@ def _main_exe_in(folder: Path, exes: list[Path]) -> Path | None:
     return exes[0] if exes else None
 
 
-def discover_emulators() -> list[Emulator]:
+def discover_installs() -> list[Emulator]:
     """Find every emulator install, including renamed / unknown forks.
 
-    The detection is folder based: any folder that contains an emulator
-    signature (qt.conf, emu-manager.json, Qt6Core.dll, ...) and a real
-    executable is watched, even if its exe is not in EMULATOR_EXES. This is
-    what keeps working when a fork is updated and renames its binary.
+    Only used for maintenance (disabling the built-in Discord presence); the
+    Rich Presence itself follows the emulator process that is running.
     """
     emulators: list[Emulator] = []
     if not EMUS_DIR.exists():
@@ -631,11 +633,87 @@ def discover_emulators() -> list[Emulator]:
     return list(uniq.values())
 
 
+def _inside_emus(path: Path) -> bool:
+    """True when *path* is inside the emus folder (case-insensitive on Windows)."""
+    try:
+        path.resolve().relative_to(EMUS_DIR.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _is_running_emulator(path: Path) -> bool:
+    """True when the path of a running process is an emulator main binary."""
+    if path.suffix.lower() != ".exe" or _is_helper_exe(path):
+        return False
+    # A well-known executable name is enough, wherever it is installed.
+    if path.name.lower() in EMULATOR_EXES:
+        return True
+    # Unknown fork: only trust the install signature inside our emus folder,
+    # so another Qt application elsewhere can never be taken for an emulator.
+    if not _inside_emus(path.parent):
+        return False
+    try:
+        parts = {p.lower() for p in path.resolve().relative_to(EMUS_DIR.resolve()).parts}
+    except (ValueError, OSError):
+        return False
+    if parts & set(SKIP_PARTS):
+        return False
+    return _looks_like_emulator_folder(path.parent)
+
+
+def discover_running_emulators(
+    snapshot: dict | None = None, cfg: dict | None = None
+) -> list[Emulator]:
+    """Return one Emulator per emulator that is running right now.
+
+    The install directory is derived from the path of the running process, so
+    nothing else has to be scanned: only the emulator that is actually open is
+    watched and published on Discord.
+    """
+    if snapshot is None:
+        snapshot = process_snapshot()
+    if cfg is None:
+        cfg = load_config()
+    ignore = {str(x).lower() for x in cfg.get("ignore", [])}
+
+    running: dict[str, Emulator] = {}
+    for key, (_pid, _name, original) in snapshot.items():
+        if key.startswith("<name>") or not original:
+            continue
+        if key in ignore:
+            continue
+        path = Path(original)
+        if not _is_running_emulator(path):
+            continue
+        try:
+            emu = Emulator(path)
+        except Exception:
+            log(f"could not read the process {path}:\n" + traceback.format_exc())
+            continue
+        running[key] = emu
+
+    emulators = list(running.values())
+    apply_overrides(emulators, cfg)
+    return emulators
+
+
 def apply_overrides(emulators: list[Emulator], cfg: dict) -> None:
     overrides = cfg.get("emulators") or {}
+    # Process paths are compared case-insensitively, so a key written as
+    # "PokeDinner (fork)" must still match the lowercased running path.
+    lookup = {
+        str(key).strip().lower(): value
+        for key, value in overrides.items()
+        if isinstance(value, dict)
+    }
     for emu in emulators:
-        data = overrides.get(emu.folder.name) or overrides.get(str(emu.exe)) or {}
-        if not isinstance(data, dict):
+        data = (
+            lookup.get(emu.folder.name.lower())
+            or lookup.get(str(emu.exe).lower())
+            or lookup.get(emu.exe.name.lower())
+        )
+        if not data:
             continue
         if data.get("name"):
             emu.name = str(data["name"])
@@ -2155,14 +2233,54 @@ def _nup_startup_sync(folder: str, upload: bool) -> None:
         log("error during the .nup scan at startup:\n" + traceback.format_exc())
 
 
+def _newest_log_mtime(emu: Emulator) -> float:
+    newest = 0.0
+    for path in emu.log_files():
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def select_active_emulator(
+    emulators: list[Emulator], snapshot: dict
+) -> tuple[Emulator, GameInfo | None]:
+    """Pick the emulator to publish.
+
+    An emulator that is running a game always wins; when several are open, the
+    freshest log decides. An emulator still in its menu is only used when no
+    game is running anywhere.
+    """
+    best: tuple[tuple[int, float], Emulator, GameInfo | None] | None = None
+    for emu in emulators:
+        entry = snapshot.get(str(emu.exe).lower())
+        game = detect_game(emu, entry[0] if entry else None)
+        score = (1 if game else 0, _newest_log_mtime(emu))
+        if best is None or score > best[0]:
+            best = (score, emu, game)
+    assert best is not None
+    return best[1], best[2]
+
+
+def _disable_builtin_for_installs() -> None:
+    """Disable the built-in presence of the installs that are not running.
+
+    Presence itself follows the running process, so this is only a maintenance
+    pass: it prevents the emulator from fighting with NS2 Presence when it is
+    started later. Running emulators are skipped by the helper itself.
+    """
+    try:
+        disable_builtin_presence(discover_installs())
+    except Exception:
+        log("could not update the emulator settings:\n" + traceback.format_exc())
+
+
 def run(cfg: dict, state: PresenceState) -> None:
     client = DiscordIPC(cfg.get("client_id") or DEFAULT_CONFIG["client_id"])
-    emulators = discover_emulators()
-    apply_overrides(emulators, cfg)
-    scan_logs_for_titles(emulators)
-    disable_builtin_presence(emulators)
 
-    log(f"{len(emulators)} emulator(s) monitored: " + ", ".join(e.label for e in emulators))
+    if cfg.get("disable_builtin_presence", True):
+        threading.Thread(target=_disable_builtin_for_installs, daemon=True).start()
 
     games_dir = str(cfg.get("games_dir") or "").strip()
     if games_dir and Path(games_dir).is_dir():
@@ -2176,11 +2294,10 @@ def run(cfg: dict, state: PresenceState) -> None:
 
     current_key = None
     started = 0.0
-    last_discovery = time.time()
-    last_builtin_check = time.time()
-    scan_seconds = max(5, int(cfg.get("scan_seconds", 30)))
+    known_running: dict[str, str] = {}
     last_stamp = (file_stamp(CONFIG_PATH), file_stamp(NUP_DB_PATH))
     force_refresh = False
+    log("waiting for an emulator to start")
 
     while True:
         try:
@@ -2189,48 +2306,32 @@ def run(cfg: dict, state: PresenceState) -> None:
                 last_stamp = stamp
                 reload_runtime_cache()
                 cfg = load_config()
-                scan_seconds = max(5, int(cfg.get("scan_seconds", 30)))
                 force_refresh = True
                 log("configuration reloaded")
 
-            if time.time() - last_discovery > scan_seconds:
-                previous = {str(e.exe).lower(): e.label for e in emulators}
-                emulators = discover_emulators()
-                apply_overrides(emulators, cfg)
-                current = {str(e.exe).lower(): e.label for e in emulators}
-                for exe, label in current.items():
-                    if exe not in previous:
-                        log(f"new emulator detected: {label} ({exe})")
-                for exe, label in previous.items():
-                    if exe not in current:
-                        log(f"emulator gone: {label} ({exe})")
-                last_discovery = time.time()
-
-            if time.time() - last_builtin_check > 300:
-                disable_builtin_presence(emulators)
-                last_builtin_check = time.time()
-
             snapshot = process_snapshot()
-            running: list[Emulator] = []
-            for emu in emulators:
-                entry = snapshot.get(str(emu.exe).lower())
-                if entry:
-                    running.append(emu)
-                    continue
-                # fallback when the path could not be read
-                entry = snapshot.get(f"<name>{emu.exe.name.lower()}")
-                if entry:
-                    running.append(emu)
+            emulators = discover_running_emulators(snapshot, cfg)
+            running = {str(e.exe).lower(): e for e in emulators}
 
-            if running:
-                emu = running[0]
-                entry = snapshot.get(str(emu.exe).lower()) or snapshot.get(
-                    f"<name>{emu.exe.name.lower()}"
+            for exe, emu in running.items():
+                if exe not in known_running:
+                    log(f"emulator detected: {emu.label} ({emu.exe})")
+                    threading.Thread(
+                        target=scan_logs_for_titles, args=([emu],), daemon=True
+                    ).start()
+            for exe, label in known_running.items():
+                if exe not in running:
+                    log(f"emulator closed: {label} ({exe})")
+                    _watchers.pop(exe, None)
+            known_running = {exe: emu.label for exe, emu in running.items()}
+
+            if emulators:
+                emu, game = select_active_emulator(emulators, snapshot)
+                key = (
+                    str(emu.exe).lower(),
+                    game.title_id if game else None,
+                    game.name if game else None,
                 )
-                pid = entry[0] if entry else None
-
-                game = detect_game(emu, pid)
-                key = (str(emu.exe).lower(), game.title_id if game else None, game.name if game else None)
                 changed = key != current_key
                 if changed:
                     current_key = key
@@ -2255,7 +2356,11 @@ def run(cfg: dict, state: PresenceState) -> None:
                     _reconnect_event.clear()
                     client.close()
                     client.connect()
-                    client.set_activity(build_activity(game, emu, started))
+                    client.set_activity(
+                        build_activity(game, emu, started)
+                        if (game or cfg.get("idle_presence", True))
+                        else None
+                    )
             else:
                 if current_key is not None:
                     log("no active emulator, presence cleared")
@@ -2281,24 +2386,29 @@ def run(cfg: dict, state: PresenceState) -> None:
 
 def selftest() -> int:
     cfg = load_config()
-    emulators = discover_emulators()
-    apply_overrides(emulators, cfg)
-    scan_logs_for_titles(emulators)
+    snapshot = process_snapshot()
 
     print(f"Base: {BASE_DIR}")
-    print(f"Emulators found: {len(emulators)}")
-    snapshot = process_snapshot()
-    for emu in emulators:
-        running = str(emu.exe).lower() in snapshot
+    running = discover_running_emulators(snapshot, cfg)
+    print(f"Running emulators: {len(running)}")
+    for emu in running:
+        entry = snapshot.get(str(emu.exe).lower(), (None, None, None))
         print(f"  - {emu.label}")
         print(f"      exe     : {emu.exe}")
+        print(f"      folder  : {emu.folder}")
+        print(f"      pid     : {entry[0]}")
         print(f"      brand   : {emu.brand}   version: {emu.version or '(unknown)'}")
-        print(f"      active  : {'yes' if running else 'no'}")
         print(f"      logs    : {[str(p) for p in emu.log_files()][:3]}")
-        game = detect_game(emu, snapshot.get(str(emu.exe).lower(), (None,))[0])
+        game = detect_game(emu, entry[0])
         print(f"      game    : {game!r}")
         if game:
             print(f"      icon    : {resolve_game_icon(game.title_id, game.name)}")
+
+    installs = discover_installs()
+    print(f"\nInstalls on disk (maintenance only): {len(installs)}")
+    for emu in installs:
+        state = "running" if str(emu.exe).lower() in snapshot else "idle"
+        print(f"  - {emu.label} [{state}] {emu.exe}")
 
     print("\nDiscord IPC protocol test:")
     payload = {"cmd": "SET_ACTIVITY", "args": {"pid": 1, "activity": {"details": "Test"}}, "nonce": "x"}

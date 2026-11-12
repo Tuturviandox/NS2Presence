@@ -1,7 +1,6 @@
 {
   "client_id": "1397286652128264252",
   "poll_seconds": 3,
-  "scan_seconds": 30,
   "show_version": true,
   "show_timer": true,
   "idle_presence": true,

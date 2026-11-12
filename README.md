@@ -14,8 +14,8 @@ The presence shows:
 file. It runs in the background, in the notification area (next to the clock),
 and:
 
-1. watches the emulator folders every **30 seconds** (updates that replace the
-   `.exe` / `.dll` files do not break it);
+1. lists the running processes and keeps only the emulator that is actually
+   open, using the path of its process to find its install folder;
 2. reads the emulator log (`user\log\eden_log.txt`) to find the running game and
    its Title ID;
 3. sends the presence to Discord through its local channel (no password, no
@@ -25,18 +25,27 @@ and:
 
 ### Automatic emulator detection
 
-No emulator list to fill in: the program scans `emus` and recognises an
-installation by its files (`qt.conf`, `emu-manager.json`, `Qt6Core.dll`,
-`Qt6Gui.dll`), then picks the real executable in the folder. Helper tools
-shipped with the emulator (`eden-cli.exe`, `*-updater.exe`, `vc_redist.x64.exe`,
-`tests.exe`, etc.) are ignored.
+No emulator list to fill in: the program follows the **process that is
+running**. It reads the path of the process (`QueryFullProcessImageNameW`), so
+the install directory is known directly and only the emulator you actually
+launched is watched; opening another one switches the presence to it.
+
+The main executable is recognised either by its well-known name (`eden.exe`,
+`lichii.exe`, `eglantine.exe`, `yuzu.exe`, ...) or, inside `emus`, by its
+installation files (`qt.conf`, `emu-manager.json`, `Qt6Core.dll`,
+`Qt6Gui.dll`). Helper tools shipped with the emulator (`eden-cli.exe`,
+`*-updater.exe`, `vc_redist.x64.exe`, `tests.exe`, etc.) are ignored.
 
 As a result, a **new folder**, a renamed fork or an executable that changes name
-during an update is detected automatically. Additions and removals are written
-to `presence.log`.
+during an update is detected automatically. Each emulator opening and closing is
+written to `presence.log`.
 
 Backup folders (`.update-backup`, `update-old`) and technical subfolders
 (`plugins`, `platforms`, `user`, etc.) are ignored.
+
+When several emulators are open at once, the one running a game wins (then the
+one with the most recent log); an emulator left in its menu is only shown when
+no game is running anywhere.
 
 ## Usage
 
@@ -129,7 +138,6 @@ The file is created on first launch. Useful values:
 | --- | --- |
 | `client_id` | Discord application ID used for the presence. |
 | `poll_seconds` | Check frequency (3 s by default). |
-| `scan_seconds` | How often to look for new emulators (30 s by default). |
 | `details_playing` / `state_playing` | Text shown while playing. `{game}` and `{emulator}` are replaced. |
 | `details_idle` / `state_idle` | Text shown when the emulator is open but no game is running. |
 | `idle_presence` | `false` to show nothing until a game is launched. |
@@ -154,7 +162,8 @@ Example to rename an emulator or force its logo:
 }
 ```
 
-The key is the **folder name** inside `emus` (or the full path of the exe).
+The key is the **folder name** inside `emus` (or the full path / executable name),
+matched case-insensitively.
 
 ## Name shown in Discord
 
@@ -178,9 +187,11 @@ extracted from `.nup` files are hosted on catbox.moe (see above).
   → **Discord diagnostics**.
 - **The presence stays on the previous game**: click **Reconnect Discord**, or
   quit and restart the program.
-- **An emulator is not detected**: check that it is inside `emus`, that its
-  folder contains `qt.conf`, `emu-manager.json`, `Qt6Core.dll` or `Qt6Gui.dll`,
-  and that the executable is not a helper tool. Details are in `presence.log`.
+- **An emulator is not detected**: the emulator must be running. A well-known
+  executable name (`eden.exe`, `lichii.exe`, ...) is accepted anywhere; an
+  unknown fork must be inside `emus`, in a folder that contains `qt.conf`,
+  `emu-manager.json`, `Qt6Core.dll` or `Qt6Gui.dll`, and must not be a helper
+  tool. Details are in `presence.log`.
 - **The icon is generic**: open the interface, choose the `.nup` folder and
   click **Scan** to fetch the real icon. If the game is not in a `.nup`, add a
   URL in `icons.json`.
